@@ -38,14 +38,164 @@ func init() {
 
 var (
 	mainContent   *fyne.Container
-	currentCmd    *exec.Cmd   // текущий запущенный процесс proxy-core
-	currentConfig string      // путь к запущенному конфигу
-	defaultConfig string      // последний запущенный файл для запуска по умолчанию
-	cmdMutex      sync.Mutex  // защита currentCmd/currentConfig
-	mainWindow    fyne.Window // главное окно для доступа из трей-меню
-	currentMode   string      // "vpn" или "proxy"
+	currentCmd    *exec.Cmd
+	currentConfig string
+	defaultConfig string
+	cmdMutex      sync.Mutex
+	mainWindow    fyne.Window
+	currentMode   string
+	sidePanel     *fyne.Container
+	panelOpen     bool = true
+	buttonTexts   map[*widget.Button]string
+	currentTab    string
+	bottomBar     *fyne.Container
 )
 
+type RouteRule struct {
+	Domain   string `json:"domain"`
+	Outbound string `json:"outbound"`
+}
+
+type RouteConfig struct {
+	DirectDomains []string `json:"direct_domains"`
+	BlockDomains  []string `json:"block_domains"`
+}
+
+const routeConfigFile = "route_config.json"
+
+func loadRouteConfig() (RouteConfig, error) {
+	var routeConfig RouteConfig
+	data, err := os.ReadFile(routeConfigFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return RouteConfig{DirectDomains: []string{}, BlockDomains: []string{}}, nil
+		}
+		return routeConfig, err
+	}
+	err = json.Unmarshal(data, &routeConfig)
+	return routeConfig, err
+}
+
+func saveRouteConfig(routeConfig RouteConfig) error {
+	data, err := json.MarshalIndent(routeConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(routeConfigFile, data, 0644)
+}
+
+func createRouteTab(a fyne.App) fyne.CanvasObject {
+	routeConfig, err := loadRouteConfig()
+	if err != nil {
+		return widget.NewLabel("Error loading route config: " + err.Error())
+	}
+
+	// Создаём контейнер для отображения доменов
+	directDomainsContainer := container.NewVBox()
+	blockDomainsContainer := container.NewVBox()
+
+	// Функция для обновления отображения доменов
+	updateDomains := func() {
+		directDomainsContainer.Objects = nil
+		blockDomainsContainer.Objects = nil
+
+		for _, domain := range routeConfig.DirectDomains {
+			domainLabel := widget.NewLabel(domain)
+			deleteBtn := widget.NewButton("Delete", func() {
+				routeConfig.DirectDomains = removeFromSlice(routeConfig.DirectDomains, domain)
+				saveRouteConfig(routeConfig)
+				//updateDomains()
+			})
+			directDomainsContainer.Add(container.NewHBox(domainLabel, deleteBtn))
+		}
+
+		for _, domain := range routeConfig.BlockDomains {
+			domainLabel := widget.NewLabel(domain)
+			deleteBtn := widget.NewButton("Delete", func() {
+				routeConfig.BlockDomains = removeFromSlice(routeConfig.BlockDomains, domain)
+				saveRouteConfig(routeConfig)
+				//updateDomains()
+			})
+			blockDomainsContainer.Add(container.NewHBox(domainLabel, deleteBtn))
+		}
+	}
+
+	// Инициализируем отображение доменов
+	updateDomains()
+
+	// Кнопка для добавления домена
+	addButton := widget.NewButton("Add Domain", func() {
+		showAddDomainDialog(a, func(domain string, outbound string) {
+			if outbound == "direct" {
+				routeConfig.DirectDomains = append(routeConfig.DirectDomains, domain)
+			} else {
+				routeConfig.BlockDomains = append(routeConfig.BlockDomains, domain)
+			}
+			saveRouteConfig(routeConfig)
+			updateDomains()
+		})
+	})
+
+	// Создаём вкладки для Direct и Block доменов
+	tabs := container.NewAppTabs(
+		container.NewTabItem("Direct Domains", directDomainsContainer),
+		container.NewTabItem("Block Domains", blockDomainsContainer),
+	)
+
+	return container.NewVBox(
+		tabs,
+		addButton,
+	)
+}
+
+func showAddDomainDialog(a fyne.App, onSave func(string, string)) {
+	win := a.NewWindow("Add Domain")
+
+	domainEntry := widget.NewEntry()
+	domainEntry.SetPlaceHolder("Enter domain")
+
+	outboundSelect := widget.NewSelect([]string{"direct", "block"}, func(choice string) {})
+
+	form := widget.NewForm(
+		widget.NewFormItem("Domain", domainEntry),
+		widget.NewFormItem("Outbound", outboundSelect),
+	)
+
+	okBtn := widget.NewButton("OK", func() {
+		domain := strings.TrimSpace(domainEntry.Text)
+		if domain == "" {
+			dialog.ShowInformation("Error", "Domain cannot be empty", win)
+			return
+		}
+		outbound := outboundSelect.Selected
+		if outbound == "" {
+			dialog.ShowInformation("Error", "Please select an outbound type", win)
+			return
+		}
+		onSave(domain, outbound)
+		win.Close()
+	})
+
+	cancelBtn := widget.NewButton("Cancel", func() {
+		win.Close()
+	})
+
+	buttons := container.NewHBox(layout.NewSpacer(), okBtn, cancelBtn)
+	dialogContent := container.NewBorder(nil, buttons, nil, nil, form)
+
+	win.SetContent(dialogContent)
+	win.Resize(fyne.NewSize(400, 150))
+	win.Show()
+}
+
+func removeFromSlice(slice []string, item string) []string {
+	for i, v := range slice {
+		if v == item {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
+}
 func main() {
 	// Запускаем системный трей в отдельной горутине.
 	go systray.Run(onReady, onExit)
@@ -61,28 +211,17 @@ func main() {
 	applyModeToConfig(currentMode)
 
 	// Боковая панель – кнопки для Profiles, Settings, Скриптов.
-	sidePanel := container.NewVBox(
-		widget.NewButtonWithIcon("Profiles", theme.DocumentCreateIcon(), func() {
-			mainContent.Objects = []fyne.CanvasObject{createProfilesList()}
-			mainContent.Refresh()
-		}),
-		widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), func() {
-			// Обработка настроек
-		}),
-		widget.NewButtonWithIcon("Scripts", theme.MediaPlayIcon(), func() {
-			mainContent.Objects = []fyne.CanvasObject{createScriptsTab(a)}
-			mainContent.Refresh()
-		}),
-		widget.NewSeparator(),
-		widget.NewLabel("Current Version: alpha 1"),
-	)
+	sidePanel = createSidePanel(a)
 
 	// Главный контейнер – изначально отображаем список профилей.
 	mainContent = container.NewVBox(createProfilesList())
 
 	// Верхняя панель.
-	hamburger := widget.NewButtonWithIcon("", theme.MenuIcon(), nil)
-	topBar := container.NewBorder(nil, nil, hamburger, nil, widget.NewLabel("Profiles"))
+	hamburger := widget.NewButtonWithIcon("", theme.MenuIcon(), func() {
+		panelOpen = !panelOpen
+		animateSidePanel(sidePanel, panelOpen)
+	})
+	topBar := container.NewBorder(nil, nil, hamburger, nil, nil)
 
 	// Создаём раскрывающийся список для выбора режима.
 	var modeSelect *widget.Select
@@ -115,22 +254,21 @@ func main() {
 		showImportProfileDialog(a)
 	})
 
-	bottomBar := container.NewBorder(nil, nil, nil, container.NewHBox(layout.NewSpacer(), modeSelect, plusBtn, linkImportBtn), nil)
+	// Инициализация нижней панели
+	bottomBar = container.NewBorder(nil, nil, nil, container.NewHBox(layout.NewSpacer(), modeSelect, plusBtn, linkImportBtn), nil)
 
 	// Итоговый контейнер.
 	content := container.NewBorder(topBar, bottomBar, sidePanel, nil, mainContent)
 	mainWindow.SetContent(content)
 
+	// Установите текущую вкладку по умолчанию
+	currentTab = "profiles"
+	updateBottomBarVisibility()
+
 	// Логика скрытия боковой панели.
-	var panelOpen = true
 	hamburger.OnTapped = func() {
 		panelOpen = !panelOpen
-		if panelOpen {
-			content = container.NewBorder(topBar, bottomBar, sidePanel, nil, mainContent)
-		} else {
-			content = container.NewBorder(topBar, bottomBar, nil, nil, mainContent)
-		}
-		mainWindow.SetContent(content)
+		animateSidePanel(sidePanel, panelOpen)
 	}
 
 	// При закрытии окна оно скрывается в трей.
@@ -140,6 +278,101 @@ func main() {
 
 	mainWindow.Resize(fyne.NewSize(700, 400))
 	mainWindow.ShowAndRun()
+}
+
+// Функция для обновления видимости нижней панели
+func updateBottomBarVisibility() {
+	if currentTab == "profiles" {
+		bottomBar.Show()
+	} else {
+		bottomBar.Hide()
+	}
+	mainWindow.Content().Refresh()
+}
+
+// Функция для создания боковой панели
+func createSidePanel(a fyne.App) *fyne.Container {
+	buttonTexts = make(map[*widget.Button]string)
+
+	profilesBtn := widget.NewButtonWithIcon(" Profiles", theme.DocumentCreateIcon(), func() {
+		currentTab = "profiles"
+		mainContent.Objects = []fyne.CanvasObject{createProfilesList()}
+		mainContent.Refresh()
+		updateBottomBarVisibility()
+	})
+	buttonTexts[profilesBtn] = "Profiles"
+
+	routeBtn := widget.NewButtonWithIcon("Route", theme.NavigateNextIcon(), func() {
+		currentTab = "route"
+		mainContent.Objects = []fyne.CanvasObject{createRouteTab(a)}
+		mainContent.Refresh()
+		updateBottomBarVisibility()
+	})
+	buttonTexts[routeBtn] = "Route"
+
+	settingsBtn := widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), func() {
+		currentTab = "settings"
+		dialog.ShowInformation("Settings", "Settings functionality is under development.", mainWindow)
+		updateBottomBarVisibility()
+	})
+	buttonTexts[settingsBtn] = "Settings"
+
+	scriptsBtn := widget.NewButtonWithIcon("Scripts", theme.MediaPlayIcon(), func() {
+		currentTab = "scripts"
+		mainContent.Objects = []fyne.CanvasObject{createScriptsTab(a)}
+		mainContent.Refresh()
+		updateBottomBarVisibility()
+	})
+	buttonTexts[scriptsBtn] = "Scripts"
+
+	aboutBtn := widget.NewButtonWithIcon("About", theme.InfoIcon(), func() {
+		currentTab = "about"
+		dialog.ShowInformation("About", "VPN UI\nVersion: alpha 1\nDeveloped by Your Company", mainWindow)
+		updateBottomBarVisibility()
+	})
+	buttonTexts[aboutBtn] = "About"
+
+	quitBtn := widget.NewButtonWithIcon("Quit", theme.CancelIcon(), func() {
+		dialog.ShowConfirm("Quit", "Are you sure you want to quit?", func(confirmed bool) {
+			if confirmed {
+				a.Quit()
+			}
+		}, mainWindow)
+	})
+	buttonTexts[quitBtn] = "Quit"
+
+	return container.NewVBox(
+		profilesBtn,
+		routeBtn,
+		settingsBtn,
+		scriptsBtn,
+		widget.NewSeparator(),
+		aboutBtn,
+		quitBtn,
+	)
+}
+
+// Функция для обновления видимости нижней панели
+
+func animateSidePanel(panel *fyne.Container, open bool) {
+	if open {
+		// Разворачиваем панель
+		for _, obj := range panel.Objects {
+			if btn, ok := obj.(*widget.Button); ok {
+				btn.SetText(buttonTexts[btn]) // Восстанавливаем текст кнопки
+			}
+		}
+		panel.Resize(fyne.NewSize(200, panel.MinSize().Height)) // Увеличиваем ширину до 300 пикселей
+	} else {
+		// Сворачиваем панель
+		for _, obj := range panel.Objects {
+			if btn, ok := obj.(*widget.Button); ok {
+				btn.SetText("") // Скрываем текст кнопки
+			}
+		}
+		panel.Resize(fyne.NewSize(50, panel.MinSize().Height))
+	}
+	panel.Refresh() // Обновляем панель
 }
 
 // loadDefaultProfile читает путь к профилю из файла default_profile.txt.
